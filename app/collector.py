@@ -30,6 +30,7 @@ from typing import Any
 
 import httpx
 
+from .budget import Budget, BudgetExceeded
 from .config import Settings
 from .models import CatalogEntry
 from .store import Store, utcnow
@@ -71,6 +72,7 @@ class Collector:
         self.store = Store(settings.database_path)
         settings.parts_dir.mkdir(parents=True, exist_ok=True)
         settings.packages_dir.mkdir(parents=True, exist_ok=True)
+        self.budget = Budget(self.store, settings.parts_dir, settings.packages_dir)
         self._runs: dict[str, RunningTask] = {}
         self._tasks: set[asyncio.Task] = set()
         self._client: httpx.AsyncClient | None = http_client
@@ -84,6 +86,16 @@ class Collector:
                 follow_redirects=True,
                 headers={"User-Agent": "observation-collector/1.0"},
             )
+        # An env-provided default only seeds a brand-new deployment; a limit
+        # previously persisted through the API always wins.
+        if self.budget.limit is None and self.settings.space_budget_bytes is not None:
+            self.store.set_budget_limit(self.settings.space_budget_bytes)
+            self.budget.limit = self.settings.space_budget_bytes
+        # Restart recovery: publish temporaries can only be half-finished
+        # publishes of the dead process, and in-memory reservations are gone.
+        purged = self.budget.purge_publish_temporaries()
+        if purged:
+            log.info("removed %d unpublished temporary file(s) at startup", purged)
         interrupted = [row["id"] for row in self.store.list("running")]
         self._recover_interrupted()
         if self.settings.auto_resume:
@@ -263,6 +275,12 @@ class Collector:
             log.info("task %s interrupted; progress kept", run.task_id)
         except FatalSourceError as exc:
             self._fail(run, str(exc), retryable=False)
+        except BudgetExceeded as exc:
+            # The directory was read but the byte budget cannot admit the
+            # package: stop this task (keeping its data) so it can be retried
+            # once space frees up or the cap is raised.
+            self._fail(run, str(exc), retryable=True)
+            self.store.event(run.task_id, "space_blocked", str(exc))
         except asyncio.CancelledError:
             raise
         except TransferError as exc:
@@ -275,6 +293,10 @@ class Collector:
             log.exception("unexpected failure for %s", run.task_id)
             self._fail(run, f"unexpected error: {type(exc).__name__}: {exc}", retryable=False)
         finally:
+            # Holds are generation-fenced: only this generation's reservation is
+            # released, so a late worker from an old round can never free the
+            # budget granted to a newer round.
+            self.budget.release(run.task_id, run.generation)
             if self._runs.get(run.task_id) is run:
                 self._runs.pop(run.task_id, None)
 
@@ -456,11 +478,28 @@ class Collector:
         # Re-read the database for the authoritative published path.
         row = self.store.get(run.task_id)
         package = Path(row["package_path"]) if row["package_path"] else None
-        if same_identity and package and package.exists():
-            if self._verify(package, entry):
-                # Refresh found the same revision already on disk: no transfer.
-                self._publish_from_existing(run, entry, package)
-                return
+
+        # Admission happens after the directory is authoritative and before any
+        # package body is received.  The hold covers every counted file this
+        # task may keep while running: the (possibly retained) part plus, for a
+        # refresh, the old package that must survive until the replacement is
+        # complete.  Budget refusal fails the task without touching other tasks.
+        if same_identity and package and package.exists() and self._verify(package, entry):
+            # Refresh found the same revision already on disk and still valid:
+            # nothing new is written, so the hold only needs to cover what is
+            # already occupied by this task.
+            self.budget.admit(run.task_id, run.generation, self.budget.task_used(run.task_id))
+            self._publish_from_existing(run, entry, package)
+            return
+
+        existing_packages = 0
+        if package is not None and package.exists():
+            existing_packages = self.budget.file_size(package)
+        self.budget.admit(
+            run.task_id,
+            run.generation,
+            entry.size + existing_packages,
+        )
 
         offset = part.stat().st_size if part.exists() else 0
         if offset > entry.size:
@@ -538,6 +577,7 @@ class Collector:
                             self._flush(handle)
                             raise Resync("downloaded more than directory size")
                         self._update(run, downloaded_bytes=written)
+                        self._on_chunk_written(run, part, written)
                     self._flush(handle)
         except httpx.HTTPError as exc:
             raise TransferError(f"package request failed: {type(exc).__name__}: {exc}") from exc
@@ -561,6 +601,13 @@ class Collector:
     def _flush(handle) -> None:
         handle.flush()
         os.fsync(handle.fileno())
+
+    def _on_chunk_written(self, run: RunningTask, part: Path, written: int) -> None:
+        """Per-chunk hook after the part file grows.
+
+        Default is a no-op; tests override it to observe on-disk state while a
+        transfer is in flight.  Production code paths never block on it.
+        """
 
     def _verify(self, path: Path, entry: CatalogEntry) -> bool:
         try:
@@ -586,18 +633,32 @@ class Collector:
         row = self.store.get(run.task_id)
         station, date = row["station"], row["date"]
         final = self.settings.packages_dir / f"{station}-{date}-{entry.sha256[:12]}.tar.gz"
-        fd, tmp_name = tempfile.mkstemp(prefix=".publish-", dir=self.settings.packages_dir)
-        tmp = Path(tmp_name)
-        try:
-            with open(part, "rb") as src, os.fdopen(fd, "wb") as dst:
-                while chunk := src.read(1024 * 1024):
-                    dst.write(chunk)
-                dst.flush()
-                os.fsync(dst.fileno())
-            os.replace(tmp, final)
-        except BaseException:
+        part = part.resolve()
+        final_resolved = final.resolve() if final.exists() else final
+
+        if part != final_resolved:
+            # A named temporary marks the in-flight publish (and is what a
+            # crash recovery sweep removes), but the move itself is an atomic
+            # rename on one filesystem: there is never a second full-size copy,
+            # so the budget only ever sees part + retained old package.
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=f".publish-{run.task_id}-", dir=self.settings.packages_dir
+            )
+            tmp = Path(tmp_name)
+            os.close(fd)
             tmp.unlink(missing_ok=True)
-            raise
+            try:
+                os.replace(part, tmp)
+                os.replace(tmp, final)
+            except BaseException:
+                # Put the verified bytes back under the part name so the task
+                # remains resumable, then drop any half-moved temporary.
+                if tmp.exists():
+                    try:
+                        os.replace(tmp, part)
+                    except OSError:
+                        tmp.unlink(missing_ok=True)
+                raise
 
         moved = self.store.cas_state(
             run.task_id,
@@ -613,14 +674,17 @@ class Collector:
             completed_at=utcnow(),
         )
         if not moved:
-            # A pause (or a newer generation) won the race: remove the artifact
-            # and keep the part file so the task is never falsely completed and
-            # never exposes an unverified/half package.
-            final.unlink(missing_ok=True)
+            # A pause (or a newer generation) won the race: the rename already
+            # happened, so move the verified file back to the part name and keep
+            # the task resumable.  It is never falsely completed and never
+            # exposes an unverified/half package.
+            if part != final_resolved:
+                try:
+                    os.replace(final, part)
+                except OSError:
+                    final.unlink(missing_ok=True)
             raise Interrupted()
 
-        if part != final:
-            part.unlink(missing_ok=True)
         for old in self.settings.packages_dir.glob(f"{station}-{date}-*.tar.gz"):
             if old != final:
                 old.unlink(missing_ok=True)

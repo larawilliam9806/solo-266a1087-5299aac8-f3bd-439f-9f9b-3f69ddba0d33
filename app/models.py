@@ -103,6 +103,40 @@ class ErrorResponse(BaseModel):
     state: str | None = None
 
 
+class BudgetRequest(BaseModel):
+    """Set the total byte cap; ``null`` removes the cap."""
+
+    limit_bytes: int | None = Field(
+        default=None, ge=0, description="Total byte cap; null clears the budget"
+    )
+
+
+class BlockedTask(BaseModel):
+    task_id: str
+    station: str
+    date: str
+    expected_size: int
+    retained_bytes: int
+    required_bytes: int
+    available_bytes: int
+    reason: str
+
+
+class BudgetHold(BaseModel):
+    task_id: str
+    generation: int
+    bytes: int
+
+
+class BudgetView(BaseModel):
+    limit_bytes: int | None = None
+    used_bytes: int = 0
+    reserved_bytes: int = 0
+    available_bytes: int | None = None
+    holds: list[BudgetHold] = Field(default_factory=list)
+    blocked: list[BlockedTask] = Field(default_factory=list)
+
+
 def sha256_file(path) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as handle:

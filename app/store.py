@@ -42,6 +42,12 @@ CREATE TABLE IF NOT EXISTS task_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_task_events_task ON task_events(task_id, seq);
+
+CREATE TABLE IF NOT EXISTS budget_config (
+    key TEXT PRIMARY KEY,
+    value INTEGER,
+    updated_at TEXT NOT NULL
+);
 """
 
 
@@ -193,6 +199,26 @@ class Store:
             .execute("SELECT * FROM task_events WHERE task_id=? ORDER BY seq", (task_id,))
             .fetchall()
         )
+
+    # -- space budget ----------------------------------------------------
+    def get_budget_limit(self) -> int | None:
+        row = self.connection().execute(
+            "SELECT value FROM budget_config WHERE key='space_limit_bytes'"
+        ).fetchone()
+        return None if row is None else row["value"]
+
+    def set_budget_limit(self, limit: int | None) -> None:
+        with self.transaction() as conn:
+            if limit is None:
+                conn.execute("DELETE FROM budget_config WHERE key='space_limit_bytes'")
+            else:
+                conn.execute(
+                    "INSERT INTO budget_config (key, value, updated_at) "
+                    "VALUES ('space_limit_bytes', ?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                    "updated_at=excluded.updated_at",
+                    (limit, utcnow()),
+                )
 
     @staticmethod
     def _event(conn: sqlite3.Connection, task_id: str, event: str, detail: str | None, at: str) -> None:

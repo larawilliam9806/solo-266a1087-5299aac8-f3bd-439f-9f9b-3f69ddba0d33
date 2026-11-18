@@ -11,9 +11,17 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 
 from . import __version__
+from .budget import BudgetRejected
 from .collector import Collector
 from .config import Settings
-from .models import ErrorResponse, StartTaskRequest, TaskState, TaskView
+from .models import (
+    BudgetRequest,
+    BudgetView,
+    ErrorResponse,
+    StartTaskRequest,
+    TaskState,
+    TaskView,
+)
 from .store import utcnow
 
 
@@ -106,6 +114,27 @@ def create_app(settings: Settings | None = None, collector: Collector | None = N
     @app.get("/healthz")
     async def healthz() -> dict:
         return {"ok": True, "version": __version__}
+
+    @app.get(
+        "/budget",
+        response_model=BudgetView,
+        summary="Inspect the space budget: cap, usage, reservations, blocked tasks",
+    )
+    async def get_budget():
+        return collector.budget.snapshot()
+
+    @app.put(
+        "/budget",
+        response_model=BudgetView,
+        status_code=200,
+        responses={409: {"model": ErrorResponse}, 422: {"model": ErrorResponse}},
+        summary="Set the total byte cap (null clears it)",
+    )
+    async def set_budget(body: BudgetRequest):
+        try:
+            return collector.budget.set_limit(body.limit_bytes)
+        except BudgetRejected as exc:
+            raise HTTPException(409, detail=str(exc))
 
     @app.post("/tasks", response_model=TaskView, status_code=201)
     async def create_task(body: StartTaskRequest, request: Request):
@@ -216,6 +245,8 @@ def create_app(settings: Settings | None = None, collector: Collector | None = N
                 "POST /tasks/{id}/refresh",
                 "GET /tasks/{id}/events",
                 "GET /tasks/{id}/package",
+                "GET /budget",
+                "PUT /budget {limit_bytes|null}",
             ],
         }
 
